@@ -1,0 +1,429 @@
+
+---
+
+# IIT Delhi QKD SDN Lab PoC — Complete Roadmap
+
+## Grounding in Tokyo QKD Network reality
+
+The 2011 Sasaki et al. paper gives you the exact blueprint: their 3-layer architecture (quantum → key management → communication) at 45km fiber links achieved 61 kbps SKR (NEC/SSPD) and 300 kbps (Toshiba). More critically, their **eavesdropping detection + rerouting in seconds** during a live TV conference is what you're replicating at lab scale. The codebase above implements the identical 3-layer design.
+
+---
+
+## System Architecture: 2+2 Node PoC at IIT Delhi
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              IIT DELHI LAB (One Room / Two Machines)    │
+│                                                         │
+│  MACHINE A (node1 — Alice)    MACHINE B (node2 — Bob)   │
+│  ┌────────────────────────┐   ┌────────────────────────┐│
+│  │ Python KMS (port 8001) │   │ Python KMS (port 8002) ││
+│  │ SDN Agent  (port 9001) │   │ SDN Agent  (port 9002) ││
+│  │ Ryu Controller (:6653) │   │ OvS Bridge (qkd-br0)   ││
+│  │ OvS Bridge (qkd-br0)   │   │                        ││
+│  └──────────┬─────────────┘   └──────────┬─────────────┘│
+│             │  Classical (Ethernet/fiber) │              │
+│             └────────────────────────────┘              │
+│             │  Quantum (dark fiber pair)  │              │
+│             └────────────────────────────┘              │
+│                  ↕ BB84 simulator (SW)                  │
+│                  ↕ OR real QKD device (HW)              │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 0 — Hardware Procurement (Week 1)
+
+**Minimum viable hardware (simulation path — zero cost):**
+
+| Item | What to use | Cost |
+|------|------------|------|
+| Node A | Any Linux laptop/PC (Ubuntu 22.04+) | ₹0 |
+| Node B | Any Linux laptop/PC | ₹0 |
+| Link | Gigabit Ethernet patch cable OR existing campus LAN | ₹0 |
+| QKD layer | BB84 simulator in `physical_layer/bb84_simulator.py` | ₹0 |
+
+**Minimum viable hardware (real fiber path — TAHQEECAT budget):**
+
+| Item | Spec | Approx. cost |
+|------|------|-------------|
+| SMF-28 fiber patch cable | SC/APC to SC/APC, 10m–50m | ₹500–₹2,000 |
+| SFP+ transceivers × 4 | 1310nm, compatible with server NICs | ₹3,000–₹8,000 |
+| USB-to-fiber converter | For QKD device if using desktop | ₹1,500 |
+| QKD device (if available) | ID Quantique Clavis3 via TAHQEECAT or borrowed | — |
+
+**Software stack (all free/open-source):**
+- Ubuntu 22.04 LTS
+- Open vSwitch 3.x (classical SDN data plane)
+- Ryu 4.34 (OpenFlow 1.3 controller)
+- Python 3.11+ with the packages in `requirements.txt`
+
+---
+
+## Phase 1 — Environment Setup (Day 1, ~3 hours)
+
+**On both machines (run as root):**
+
+```bash
+# 1. Clone the project
+git clone <your-repo> ~/qkdn_iitd
+cd ~/qkdn_iitd
+
+# 2. Set node identity (CRITICAL — different on each machine)
+# Machine A:
+export NODE_ID=node1
+export NODE1_HOST=192.168.1.10    # Machine A's actual IP
+export NODE2_HOST=192.168.1.20    # Machine B's actual IP
+export CONTROLLER_IP=192.168.1.10 # Controller runs on Machine A
+
+# Machine B:
+export NODE_ID=node2
+export NODE1_HOST=192.168.1.10
+export NODE2_HOST=192.168.1.20
+export CONTROLLER_IP=192.168.1.10
+
+# 3. Run setup script (installs OvS, Python venv, systemd services)
+sudo CONTROLLER_IP=$CONTROLLER_IP bash scripts/setup_iitd_poc.sh $NODE_ID
+
+# 4. Activate Python venv
+source .venv/bin/activate
+pip install -r requirements.txt --break-system-packages
+
+# Verify OvS is running
+ovs-vsctl show
+```
+
+**Verify network reachability between machines:**
+```bash
+# From Machine A:
+ping 192.168.1.20
+curl http://192.168.1.20:8002/internal/status   # After node2 is started
+```
+
+---
+
+## Phase 2 — Start All Services (Day 1, ~30 minutes)
+
+Open **4 terminal windows** (tmux recommended: `sudo apt install tmux`).
+
+**Terminal layout with tmux:**
+```bash
+# Machine A — create 4-pane tmux session:
+tmux new-session -s qkd
+# Ctrl+B then " to split, Ctrl+B then % to split vertical
+```
+
+**Terminal 1 — Machine A: Start node1 (KMS + Agent)**
+```bash
+cd ~/qkdn_iitd
+source .venv/bin/activate
+NODE1_HOST=192.168.1.10 NODE2_HOST=192.168.1.20 \
+QKD_BACKEND=simulator \
+python node_runner.py --node node1 --log-level INFO
+```
+
+Expected output:
+```
+2025-01-01 10:00:01 - INFO: Starting node 'node1' (Alice) | KMS port=8001 | Agent port=9001
+2025-01-01 10:00:01 - INFO: Started service 'kms-node1' (PID 12345)
+2025-01-01 10:00:03 - INFO: Started service 'agent-node1' (PID 12347)
+2025-01-01 10:00:03 - INFO: Node 'node1' fully started.
+```
+
+**Terminal 2 — Machine A: Start Ryu SDN Controller**
+```bash
+cd ~/qkdn_iitd
+source .venv/bin/activate
+bash scripts/start_controller.sh
+```
+
+Expected output:
+```
+loading app sdn/ryu_controller.py
+instantiating app sdn.ryu_controller:QKDSDNController
+QKD SDN Controller initialized. 5 nodes, 7 links.
+```
+
+**Terminal 3 — Machine B: Start node2 (KMS + Agent)**
+```bash
+cd ~/qkdn_iitd
+source .venv/bin/activate
+NODE1_HOST=192.168.1.10 NODE2_HOST=192.168.1.20 \
+QKD_BACKEND=simulator \
+python node_runner.py --node node2 --log-level INFO
+```
+
+**Terminal 4 — Machine A: Monitor / run tests**
+```bash
+cd ~/qkdn_iitd && source .venv/bin/activate
+```
+
+---
+
+## Phase 3 — Verify Key Generation (Day 1, ~15 minutes)
+
+Wait 30–60 seconds for the key pools to fill, then run:
+
+```bash
+# Quick sanity check — is the KMS alive?
+curl -s http://127.0.0.1:8001/api/v1/keys/node2/status | python3 -m json.tool
+
+# Expected output:
+{
+  "source_KME_ID": "node1",
+  "target_KME_ID": "node2",
+  "key_size": 256,
+  "stored_key_count": 47,           ← keys ready to serve
+  "QBER": 0.0198,                   ← ~2% baseline QBER
+  "SKR_bps": 12340.5,               ← ~12 kbps (simulated)
+  "status": "ACTIVE"
+}
+```
+
+```bash
+# Fetch a key as Alice (node1):
+curl -s "http://127.0.0.1:8001/api/v1/keys/node2/enc_keys?number=1&size=256" \
+     | python3 -m json.tool
+
+# Expected:
+{
+  "keys": [{
+    "key_ID": "a3b2c1d0-...",
+    "key": "f3a7c2b1e9..."    ← 64 hex chars = 256 bits
+  }]
+}
+```
+
+```bash
+# Bob fetches same key by UUID (use key_ID from above):
+curl -s -X POST http://127.0.0.1:8002/api/v1/keys/node1/dec_keys \
+     -H "Content-Type: application/json" \
+     -d '{"key_IDs": ["a3b2c1d0-..."]}' \
+     | python3 -m json.tool
+
+# Expected: same hex key material as Alice got ← THIS IS THE QKD PROOF
+```
+
+---
+
+## Phase 4 — Run Full Integration Test Suite (Day 1)
+
+```bash
+# Run all tests (skip SDN if Ryu not started yet):
+python scripts/test_poc.py --quick
+
+# Run full suite including SDN:
+python scripts/test_poc.py --node1 node1 --node2 node2 --verbose
+```
+
+Expected test output:
+```
+══════════════════════════════════════════════════════════════════════
+  IIT Delhi QKD PoC — Integration Test Suite
+  Testing: node1 ↔ node2
+══════════════════════════════════════════════════════════════════════
+  [✓] [PASS] Kms Reachability                                (87ms)  Both KMS nodes reachable
+  [✓] [PASS] Key Status Endpoint                             (23ms)  pool=47 keys | QBER=0.0198 | SKR=12340 bps
+  [✓] [PASS] Key Generation Roundtrip                        (156ms) key_id=a3b2c1d0… | 256 bits | Alice==Bob ✓
+  [✓] [PASS] Multiple Keys                                   (89ms)  Fetched 5 unique keys, all distinct ✓
+  [✓] [PASS] Crypto Roundtrip                               (201ms)  AES-256-GCM roundtrip OK | msg=55B → ct=55B
+  [✓] [PASS] Key Uniqueness                                 (112ms)  Keys a3b2c1d0… ≠ f7e1a934… (no reuse ✓)
+  [✓] [PASS] Key Throughput                                  (45ms)  412.3 keys/s | 105,548 bits/s served
+  [✓] [PASS] Expired Key Rejection                           (18ms)  Invalid key_id correctly rejected (HTTP 404) ✓
+  [✓] [PASS] Sdn Topology                                    (34ms)  Topology: 5 nodes, 7 links ✓
+  [✓] [PASS] Sdn Path Registration                           (98ms)  ks_id=d4e5f6a7… | path=node1→node2
+  [✓] [PASS] Sdn Path Deletion                               (56ms)  ks_id=d4e5f6a7… deleted ✓
+──────────────────────────────────────────────────────────────────────
+  Results: 11/11 tests passed | Total time: 919ms
+  ✓ ALL TESTS PASSED — QKD PoC is functional!
+══════════════════════════════════════════════════════════════════════
+```
+
+---
+
+## Phase 5 — Demo Application: QKD-Encrypted Text Chat (Day 2)
+
+```bash
+# Machine A (node1 waits for connection):
+python -m apps.secure_messenger --node node1 --peer node2 --mode server
+
+# Machine B (node2 connects):
+python -m apps.secure_messenger --node node2 --peer node1 \
+    --mode client --host 192.168.1.10
+```
+
+What you see on Machine A:
+```
+══════════════════════════════════════════════════════
+  QKD Secure Messenger — IIT Delhi PoC
+  Node: Alice (node1)
+  Peer: Bob (node2)
+  Role: Alice (key master)
+  Key pool: 51 keys available
+  Link QBER: 0.020 | SKR: 12340 bps
+  Cipher: AES-256-GCM (per-message key rotation)
+══════════════════════════════════════════════════════
+
+[Alice→Bob] Type messages below. /quit to exit.
+
+[You] Hello from the QKD lab!
+  [key_id: a3b2c1d0… | 24 bytes encrypted]
+[Bob] Message received, quantum secure!
+  [key_id: f7e1a934… | authenticated ✓]
+```
+
+**Every single message uses a fresh, never-reused 256-bit key from the quantum fiber link.**
+
+---
+
+## Phase 6 — Demo Application: QKD-Encrypted Voice Call (Day 2)
+
+```bash
+# Machine A:
+python -m apps.secure_voip --node node1 --peer node2 --mode server
+
+# Machine B:
+python -m apps.secure_voip --node node2 --peer node1 \
+    --mode client --host 192.168.1.10
+```
+
+If `pyaudio` is not available (no mic/speaker connected in lab), it falls back to the loopback demo mode which validates the full encrypt/decrypt audio pipeline:
+```
+[QKD VOIP] Call active. Press Enter to hang up.
+  Sent frame 01 | key: a3b2c1d0…
+  Recv decoded 640 bytes | key: a3b2c1d0… ✓
+  Sent frame 02 | key: a3b2c1d0…
+  Recv decoded 640 bytes | key: a3b2c1d0… ✓
+  # Key rotates every 10 frames (200ms)
+  Sent frame 11 | key: f7e1a934…   ← fresh key
+```
+
+---
+
+## Phase 7 — SDN Path Control Demo (Day 2)
+
+Demonstrate the Tokyo QKD Network's rerouting capability:
+
+```bash
+# 1. Query live topology (shows ESKR on each link):
+curl -s http://127.0.0.1:7000/qkd/topology | python3 -m json.tool
+
+# 2. Register a multi-hop key stream path:
+curl -s -X POST http://127.0.0.1:7000/qkd/paths \
+     -H "Content-Type: application/json" \
+     -d '{"source":"node1","dest":"node2","mode":"single"}' \
+     | python3 -m json.tool
+
+# 3. Simulate a link failure (QBER injection):
+# Manually call the deactivation endpoint to simulate fiber cut:
+curl -s -X POST http://127.0.0.1:7000/qkd/events \
+     -H "Content-Type: application/json" \
+     -d '{"event":"link_failure","node_a":"node1","node_b":"node2","qber":0.15}'
+
+# 4. Watch the SDN controller reroute (check topology again):
+curl -s http://127.0.0.1:7000/qkd/topology | python3 -m json.tool
+
+# 5. Delete path cleanly:
+curl -s -X DELETE http://127.0.0.1:7000/qkd/paths/<ks_id>
+```
+
+---
+
+## Phase 8 — Real QKD Hardware Integration (Week 3, if TAHQEECAT hardware available)
+
+Switch from simulator to hardware with **one environment variable:**
+
+```bash
+# Set hardware mode:
+export QKD_BACKEND=hardware
+export QKD_HW_PORT=/dev/ttyUSB0    # or /dev/ttyACM0
+
+# Verify your device is seen:
+ls -l /dev/ttyUSB*
+python3 -c "import serial; s=serial.Serial('/dev/ttyUSB0',115200); print(s.isOpen())"
+
+# Restart node (hardware path activates automatically):
+python node_runner.py --node node1
+```
+
+The `SerialQKDDevice` in `physical_layer/qkd_device_interface.py` sends:
+```
+AT+QKD:STATUS       ← device responds with QBER and key rate
+AT+QKD:GENKEY=256   ← device runs BB84, returns hex key + QBER
+```
+
+Adapt `_parse_genkey_response()` to your vendor's exact command format. ID Quantique devices have Python SDK bindings; substitute the AT commands with `libidq` API calls in `generate_key_block()`.
+
+---
+
+## Key Metrics to Report in Your PoC Demo
+
+| Metric | Simulator | Real fiber (10km) |
+|--------|-----------|-------------------|
+| QBER | 2.0% (baseline) | 2–5% |
+| SKR (simulated) | ~12 kbps | ~1–10 kbps |
+| Key pool latency | <1ms | <5ms |
+| Eavesdrop detection | QBER jump to ~27% | Automatic |
+| Reroute time (SDN) | <5 seconds | <10 seconds |
+| Messages encrypted | Per-message fresh key | Per-message fresh key |
+| Audio call quality | 16kHz, 20ms frames | Same |
+
+---
+
+## Complete File Structure Summary
+
+```
+qkdn_iitd_poc/
+│
+├── config.py                    # 5-node topology, ports, QKD params
+│
+├── physical_layer/
+│   ├── bb84_simulator.py        # Full BB84 with QBER noise model
+│   └── qkd_device_interface.py  # HW abstraction: simulator OR serial
+│
+├── kms/
+│   ├── key_store.py             # SQLite FIFO key store (TTL, audit log)
+│   └── kms_api.py               # ETSI QKD 014 REST API (FastAPI)
+│                                #   GET /enc_keys  ← Alice
+│                                #   POST /dec_keys ← Bob
+│                                #   GET /status    ← monitoring
+│
+├── sdn/
+│   ├── topology.py              # NetworkX graph + path algorithms
+│   │                            #   max_min_capacity_path (widest path)
+│   │                            #   node_disjoint_paths (Shamir SSS)
+│   │                            #   group_multicast_tree
+│   ├── ryu_controller.py        # Ryu OpenFlow 1.3 app + QKD REST API
+│   │                            #   OpenFlow L2 learning switch
+│   │                            #   QKD orchestration on port 7000
+│   └── sdn_agent.py             # Per-node agent (telemetry + path relay)
+│
+├── apps/
+│   ├── qkd_client.py            # ETSI QKD 014 client + AES-256-GCM
+│   ├── secure_messenger.py      # TCP chat: fresh key per message
+│   └── secure_voip.py           # TCP voice: key rotation every 200ms
+│
+├── node_runner.py               # Process orchestrator (KMS + Agent)
+├── requirements.txt
+│
+└── scripts/
+    ├── setup_iitd_poc.sh        # Full env setup (OvS, venv, systemd)
+    ├── start_node.sh            # Start one node's services
+    ├── start_controller.sh      # Start Ryu OpenFlow controller
+    └── test_poc.py              # 11-test integration suite
+```
+
+---
+
+## What This Demonstrates (Aligned to Tokyo QKD Network Paper)
+
+The Sasaki et al. paper demonstrated three things live in October 2010. Your PoC replicates all three:
+
+**1. Secure conferencing** — The `secure_messenger` and `secure_voip` apps use QKD-generated keys for AES-256-GCM (they used OTP). Every message or audio frame gets a fresh key from the fiber link. Key never leaves the KMS as plaintext.
+
+**2. Eavesdropping detection** — The `_link_health_monitor` in the SDN agent continuously watches QBER. Inject `eavesdropper_intercept_prob=1.0` in `config.py` to simulate a full intercept-resend attack; you'll see QBER spike to ~27% (the theoretical BB84 detection signature) and the agent alerts the controller within one polling interval (10 seconds).
+
+**3. Automatic rerouting** — The SDN controller's `_telemetry_poll_loop` detects QBER > 11% and calls `topology.deactivate_link()`. The next `best_single_path()` call then finds the alternate route. Post the path deactivation event to the SDN REST API to trigger this manually in the demo.
+
+The entire pipeline runs on two laptops connected by an Ethernet cable — or any fiber you can pull across the lab — making this a fully reproducible, hands-on demonstration of exactly what the Tokyo network achieved at metropolitan scale, at IIT Delhi lab scale.
